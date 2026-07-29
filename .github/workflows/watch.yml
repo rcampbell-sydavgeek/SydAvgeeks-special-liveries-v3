@@ -59,7 +59,7 @@ jobs:
             echo "Push rejected, merging latest and retrying ($i/5)..."
             git fetch origin main
             git merge -X ours -m "Merge remote watcher state [skip ci]" origin/main
-          done
+          done  
 
           echo "Failed to push state after retries."
           exit 1
