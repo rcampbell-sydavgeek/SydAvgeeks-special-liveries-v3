@@ -47,14 +47,18 @@ jobs:
 
           git commit -m "Update watcher state [skip ci]"
 
-          # Retry the push a few times in case another run's commit
-          # landed in between our commit and our push.
+          # Retry the push a few times in case another run's commit landed
+          # in between our commit and our push. These two files are just
+          # disposable caches the script regenerates each run, so on a
+          # conflict we simply keep our (newer) version rather than trying
+          # to line-match content - there's nothing meaningful to merge.
           for i in 1 2 3 4 5; do
             if git push; then
               exit 0
             fi
-            echo "Push rejected, pulling latest and retrying ($i/5)..."
-            git pull --rebase
+            echo "Push rejected, merging latest and retrying ($i/5)..."
+            git fetch origin main
+            git merge -X ours -m "Merge remote watcher state [skip ci]" origin/main
           done
 
           echo "Failed to push state after retries."
