@@ -46,6 +46,9 @@ NOTIFIED_FILE = Path("notified.json")       # icao24 -> last notified timestamp
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 HEXDB_REG_TO_HEX = "https://hexdb.io/reg-hex?reg={reg}"
 HEXDB_CALLSIGN_DEST = "https://hexdb.io/callsign-des_icao?callsign={cs}"
+HEXDB_CALLSIGN_ORIGIN = "https://hexdb.io/callsign-origin_icao?callsign={cs}"
+ADSBDB_CALLSIGN = "https://api.adsbdb.com/v0/callsign/{cs}"
+ADSBDB_AIRCRAFT = "https://api.adsbdb.com/v0/aircraft/{reg}"
 
 HEADERS = {"User-Agent": "yssy-livery-watcher/1.0"}
 
@@ -92,9 +95,11 @@ def fetch_registrations():
 
 
 def get_icao24(registration, cache):
-    """Look up (and cache) the ICAO24 hex for a registration via hexdb.io."""
+    """Look up (and cache) the ICAO24 hex for a registration."""
     if registration in cache:
         return cache[registration]
+
+    # Try hexdb.io first
     url = HEXDB_REG_TO_HEX.format(reg=registration)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -104,6 +109,23 @@ def get_icao24(registration, cache):
             return hexcode
     except requests.RequestException:
         pass
+
+    # Fall back to adsbdb.com, which draws from a different registry dataset
+    # and often has aircraft (especially non-US/UK registries) hexdb.io lacks.
+    try:
+        resp = requests.get(
+            ADSBDB_AIRCRAFT.format(reg=registration), headers=HEADERS, timeout=15
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            hexcode = data.get("response", {}).get("aircraft", {}).get("mode_s")
+            if hexcode:
+                hexcode = hexcode.strip().lower()
+                cache[registration] = hexcode
+                return hexcode
+    except (requests.RequestException, ValueError):
+        pass
+
     return None
 
 
@@ -121,6 +143,45 @@ def get_destination(callsign):
                 return dest
     except requests.RequestException:
         pass
+    return None
+
+
+def get_origin(callsign):
+    """Resolve a callsign to its departure airport ICAO code, if known."""
+    callsign = callsign.strip()
+    if not callsign:
+        return None
+
+    # Try hexdb.io first
+    url = HEXDB_CALLSIGN_ORIGIN.format(cs=callsign)
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code == 200:
+            origin = resp.text.strip().upper()
+            if origin and "not found" not in origin.lower() and len(origin) == 4:
+                return origin
+    except requests.RequestException:
+        pass
+
+    # Fall back to adsbdb.com, which draws from a broader route dataset and
+    # sometimes has origin data hexdb.io is missing.
+    try:
+        resp = requests.get(
+            ADSBDB_CALLSIGN.format(cs=callsign), headers=HEADERS, timeout=15
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            origin = (
+                data.get("response", {})
+                .get("flightroute", {})
+                .get("origin", {})
+                .get("icao_code")
+            )
+            if origin:
+                return origin.strip().upper()
+    except (requests.RequestException, ValueError):
+        pass
+
     return None
 
 
@@ -202,10 +263,12 @@ def main():
         print(f"{reg} ({callsign}) -> destination {dest!r} (comparing to target {target_airport!r})")
 
         if dest == target_airport:
+            origin = get_origin(callsign)
+            origin_text = f"from {origin} " if origin else ""
             notes = f" ({entry['notes']})" if entry["notes"] else ""
             send_ntfy(
                 title=f"{reg} inbound to {target_airport}",
-                message=f"{reg}{notes} - callsign {callsign} - heading to {target_airport}",
+                message=f"{reg}{notes} - callsign {callsign} - {origin_text}heading to {target_airport}",
             )
             notified[icao24] = now
 
