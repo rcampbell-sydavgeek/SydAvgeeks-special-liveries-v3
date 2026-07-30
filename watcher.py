@@ -69,15 +69,26 @@ def fetch_registrations():
     """Pull the current watchlist from the published Google Sheet CSV."""
     if not GOOGLE_SHEET_CSV_URL:
         raise SystemExit("GOOGLE_SHEET_CSV_URL is not set.")
-    resp = requests.get(GOOGLE_SHEET_CSV_URL, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    reader = csv.DictReader(io.StringIO(resp.text))
-    rows = []
-    for row in reader:
-        reg = (row.get("registration") or "").strip().upper()
-        if reg:
-            rows.append({"registration": reg, "notes": (row.get("notes") or "").strip()})
-    return rows
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            resp = requests.get(GOOGLE_SHEET_CSV_URL, headers=HEADERS, timeout=45)
+            resp.raise_for_status()
+            reader = csv.DictReader(io.StringIO(resp.text))
+            rows = []
+            for row in reader:
+                reg = (row.get("registration") or "").strip().upper()
+                if reg:
+                    rows.append({"registration": reg, "notes": (row.get("notes") or "").strip()})
+            return rows
+        except requests.RequestException as e:
+            last_error = e
+            print(f"Attempt {attempt}/3 to fetch Google Sheet failed: {e}")
+            if attempt < 3:
+                time.sleep(5)
+
+    raise SystemExit(f"Could not fetch Google Sheet after 3 attempts: {last_error}")
 
 
 def get_icao24(registration, cache):
