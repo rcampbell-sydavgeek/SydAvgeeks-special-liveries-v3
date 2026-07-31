@@ -268,7 +268,7 @@ def main():
             notes = f" ({entry['notes']})" if entry["notes"] else ""
             send_ntfy(
                 title=f"{reg} inbound to {target_airport}",
-                message=f"{reg}{notes} - callsign {callsign} - {origin_text}heading to {target_airport}",
+                message=f"{reg}{notes} - {callsign} - {origin_text}heading to {target_airport}",
             )
             notified[icao24] = now
 
