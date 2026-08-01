@@ -16,9 +16,12 @@ don't spam duplicate notifications.
 import csv
 import io
 import json
+import math
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from icao_nnumber_converter_us import n_to_icao
@@ -36,6 +39,15 @@ GOOGLE_SHEET_CSV_URL = os.environ.get("GOOGLE_SHEET_CSV_URL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
 TARGET_AIRPORT_ICAO = "YSSY"
+
+# Coordinates of the target airport, used only for the rough ETA estimate
+# in notifications (straight-line distance / current ground speed - not a
+# real flight-plan ETA, just a helpful approximation).
+TARGET_AIRPORT_LAT = -33.9461
+TARGET_AIRPORT_LON = 151.1772
+
+# Timezone to display the estimated arrival time in
+DISPLAY_TZ = ZoneInfo("Australia/Sydney")
 
 # How many hours before we're willing to re-notify about the same aircraft
 # heading to the same airport again (covers next day's flight, etc.)
@@ -204,6 +216,54 @@ def fetch_opensky_states():
     return data.get("states") or []
 
 
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance between two lat/lon points, in kilometres."""
+    r = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    )
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def estimate_eta_text(lat, lon, ground_speed_ms):
+    """
+    Rough ETA estimate: straight-line distance to the target airport divided
+    by current ground speed. This is NOT a real flight-plan ETA - it ignores
+    the actual route, remaining descent/holding, and any speed changes - but
+    it's a reasonable ballpark for a notification.
+    Returns a string like "~1h 42m (approx 14:35 AEST)", or None if we don't
+    have enough data (e.g. ground speed is missing or near zero).
+    """
+    if lat is None or lon is None or not ground_speed_ms or ground_speed_ms < 20:
+        return None
+
+    distance_km = haversine_km(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
+    speed_kmh = ground_speed_ms * 3.6
+    eta_hours = distance_km / speed_kmh
+
+    if eta_hours > 20:
+        # Sanity cap - at this range the straight-line estimate is too rough
+        # to be worth showing (e.g. still near the departure airport).
+        return None
+
+    hours = int(eta_hours)
+    minutes = int(round((eta_hours - hours) * 60))
+    if minutes == 60:
+        hours += 1
+        minutes = 0
+
+    arrival_utc = datetime.now(timezone.utc) + timedelta(hours=eta_hours)
+    arrival_local = arrival_utc.astimezone(DISPLAY_TZ)
+    tz_label = arrival_local.tzname() or "local"
+
+    duration_text = f"{hours}h {minutes}m" if hours else f"{minutes}m"
+    return f"~{duration_text} (approx {arrival_local.strftime('%H:%M')} {tz_label})"
+
+
 def send_ntfy(title, message):
     if not NTFY_TOPIC:
         print("NTFY_TOPIC not set - skipping push notification:", title, message)
@@ -278,9 +338,17 @@ def main():
             origin = get_origin(callsign)
             origin_text = f"from {origin} " if origin else ""
             notes = f" ({entry['notes']})" if entry["notes"] else ""
+
+            lon, lat, ground_speed = state[5], state[6], state[9]
+            eta_text = estimate_eta_text(lat, lon, ground_speed)
+            eta_part = f" - ETA {eta_text}" if eta_text else ""
+
             send_ntfy(
                 title=f"{reg} inbound to {target_airport}",
-                message=f"{reg}{notes} - callsign {callsign} - {origin_text}heading to {target_airport}",
+                message=(
+                    f"{reg}{notes} - callsign {callsign} - {origin_text}"
+                    f"heading to {target_airport}{eta_part}"
+                ),
             )
             notified[icao24] = now
 
