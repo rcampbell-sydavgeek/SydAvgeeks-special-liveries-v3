@@ -346,7 +346,7 @@ def main():
             send_ntfy(
                 title=f"{reg} inbound to {target_airport}",
                 message=(
-                    f"{reg}{notes} - callsign {callsign} - {origin_text}"
+                    f"{reg}{notes} - {callsign} - {origin_text}"
                     f"heading to {target_airport}{eta_part}"
                 ),
             )
