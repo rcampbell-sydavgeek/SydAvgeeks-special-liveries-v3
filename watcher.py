@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import requests
+from icao_nnumber_converter_us import n_to_icao
 
 # ---------------------------------------------------------------------------
 # CONFIG - edit these or set as environment variables / GitHub Secrets
@@ -99,7 +100,18 @@ def get_icao24(registration, cache):
     if registration in cache:
         return cache[registration]
 
-    # Try hexdb.io first
+    # US "N-number" registrations map to their ICAO24 hex via a fixed,
+    # publicly documented formula - no lookup needed, and it can't go stale.
+    if registration.startswith("N"):
+        try:
+            hexcode = n_to_icao(registration).strip().lower()
+            if hexcode:
+                cache[registration] = hexcode
+                return hexcode
+        except (ValueError, KeyError):
+            pass  # not a valid N-number format - fall through to lookups
+
+    # Try hexdb.io next
     url = HEXDB_REG_TO_HEX.format(reg=registration)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -268,7 +280,7 @@ def main():
             notes = f" ({entry['notes']})" if entry["notes"] else ""
             send_ntfy(
                 title=f"{reg} inbound to {target_airport}",
-                message=f"{reg}{notes} - {callsign} - {origin_text}heading to {target_airport}",
+                message=f"{reg}{notes} - callsign {callsign} - {origin_text}heading to {target_airport}",
             )
             notified[icao24] = now
 
