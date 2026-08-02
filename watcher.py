@@ -4,9 +4,13 @@ YSSY Special Livery Watcher
 ---------------------------
 Reads a list of tracked aircraft registrations from a Google Sheet,
 checks their live positions via OpenSky, resolves each airborne
-aircraft's destination airport via hexdb.io, and sends a push
-notification (via ntfy.sh) the first time a tracked aircraft is
-found heading to the target airport.
+aircraft's destination AND origin airport via hexdb.io/adsbdb.com,
+and sends a push notification (via ntfy.sh):
+  - the first time a tracked aircraft is found heading TO YSSY, and
+  - the first time a tracked aircraft is found to have just departed
+    FROM YSSY
+These are independent alerts - an aircraft can trigger both, on
+different runs, without one blocking the other.
 
 Designed to be run on a schedule (e.g. every 5 minutes via GitHub
 Actions cron). State is kept in small JSON files so repeat runs
@@ -54,7 +58,8 @@ DISPLAY_TZ = ZoneInfo("Australia/Sydney")
 RENOTIFY_AFTER_HOURS = 20
 
 CACHE_FILE = Path("icao24_cache.json")     # registration -> icao24 hex
-NOTIFIED_FILE = Path("notified.json")       # icao24 -> last notified timestamp
+NOTIFIED_FILE = Path("notified.json")       # icao24 -> last notified timestamp (arrivals)
+NOTIFIED_DEPARTURES_FILE = Path("notified_departures.json")  # icao24 -> last notified timestamp (departures)
 
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 HEXDB_REG_TO_HEX = "https://hexdb.io/reg-hex?reg={reg}"
@@ -347,6 +352,7 @@ def main():
 
     icao24_cache = load_json(CACHE_FILE, {})
     notified = load_json(NOTIFIED_FILE, {})
+    notified_departures = load_json(NOTIFIED_DEPARTURES_FILE, {})
 
     registrations = fetch_registrations()
     print(f"Loaded {len(registrations)} tracked registrations.")
@@ -384,48 +390,71 @@ def main():
 
         entry = tracked[icao24]
         reg = entry["registration"]
+        notes = f" ({entry['notes']})" if entry["notes"] else ""
 
-        last_notified = notified.get(icao24)
-        if last_notified and (now - last_notified) < RENOTIFY_AFTER_HOURS * 3600:
-            continue  # already alerted recently for this aircraft
+        # --- Arrival check: is this aircraft heading TO the target airport?
+        last_notified_arr = notified.get(icao24)
+        skip_arrival = last_notified_arr and (now - last_notified_arr) < RENOTIFY_AFTER_HOURS * 3600
 
-        dest = get_destination(callsign)
-        print(f"{reg} ({callsign}) -> destination {dest!r} (comparing to target {target_airport!r})")
+        if not skip_arrival:
+            dest = get_destination(callsign)
+            print(f"{reg} ({callsign}) -> destination {dest!r} (comparing to target {target_airport!r})")
 
-        if dest == target_airport:
-            lon, lat, ground_speed = state[5], state[6], state[9]
-            true_track = state[10]
+            if dest == target_airport:
+                lon, lat, ground_speed = state[5], state[6], state[9]
+                true_track = state[10]
 
-            if not heading_is_plausible(lat, lon, true_track, target_lat=TARGET_AIRPORT_LAT, target_lon=TARGET_AIRPORT_LON):
-                required_bearing = bearing_deg(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
-                print(
-                    f"  -> SUPPRESSED: {reg} destination lookup says {target_airport}, "
-                    f"but actual track ({true_track}) doesn't point that way "
-                    f"(would need ~{required_bearing:.0f}). Likely a stale route "
-                    f"lookup (common for charter/cargo callsigns) - not alerting."
-                )
-                time.sleep(0.2)
-                continue
+                if not heading_is_plausible(lat, lon, true_track, target_lat=TARGET_AIRPORT_LAT, target_lon=TARGET_AIRPORT_LON):
+                    required_bearing = bearing_deg(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
+                    print(
+                        f"  -> SUPPRESSED: {reg} destination lookup says {target_airport}, "
+                        f"but actual track ({true_track}) doesn't point that way "
+                        f"(would need ~{required_bearing:.0f}). Likely a stale route "
+                        f"lookup (common for charter/cargo callsigns) - not alerting."
+                    )
+                else:
+                    origin = get_origin(callsign)
+                    origin_text = f"from {origin} " if origin else ""
 
+                    eta_text = estimate_eta_text(lat, lon, ground_speed)
+                    eta_part = f" - ETA {eta_text}" if eta_text else ""
+
+                    send_ntfy(
+                        title=f"{reg} inbound to {target_airport}",
+                        message=(
+                            f"{reg}{notes} - callsign {callsign} - {origin_text}"
+                            f"heading to {target_airport}{eta_part}"
+                        ),
+                    )
+                    notified[icao24] = now
+
+            time.sleep(0.2)  # be polite to hexdb.io
+
+        # --- Departure check: has this aircraft just left the target airport?
+        last_notified_dep = notified_departures.get(icao24)
+        skip_departure = last_notified_dep and (now - last_notified_dep) < RENOTIFY_AFTER_HOURS * 3600
+
+        if not skip_departure:
             origin = get_origin(callsign)
-            origin_text = f"from {origin} " if origin else ""
-            notes = f" ({entry['notes']})" if entry["notes"] else ""
+            print(f"{reg} ({callsign}) -> origin {origin!r} (comparing to target {target_airport!r} for departure)")
 
-            eta_text = estimate_eta_text(lat, lon, ground_speed)
-            eta_part = f" - ETA {eta_text}" if eta_text else ""
+            if origin == target_airport:
+                dest_after = get_destination(callsign)
+                dest_text = f" - heading to {dest_after}" if dest_after else ""
 
-            send_ntfy(
-                title=f"{reg} inbound to {target_airport}",
-                message=(
-                    f"{reg}{notes} - callsign {callsign} - {origin_text}"
-                    f"heading to {target_airport}{eta_part}"
-                ),
-            )
-            notified[icao24] = now
+                send_ntfy(
+                    title=f"{reg} has departed {target_airport}",
+                    message=(
+                        f"{reg}{notes} - callsign {callsign} - "
+                        f"has just departed {target_airport}{dest_text}"
+                    ),
+                )
+                notified_departures[icao24] = now
 
-        time.sleep(0.2)  # be polite to hexdb.io
+            time.sleep(0.2)  # be polite to hexdb.io
 
     save_json(NOTIFIED_FILE, notified)
+    save_json(NOTIFIED_DEPARTURES_FILE, notified_departures)
 
 
 if __name__ == "__main__":
