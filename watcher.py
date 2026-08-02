@@ -432,7 +432,7 @@ def main():
                     send_ntfy(
                         title=f"{reg} inbound to {target_airport}",
                         message=(
-                            f"{reg}{notes} - callsign {callsign} - {origin_text}"
+                            f"{reg}{notes} - {callsign} - {origin_text}"
                             f"heading to {target_airport}{eta_part}"
                         ),
                     )
@@ -471,7 +471,7 @@ def main():
                         send_ntfy(
                             title=f"{reg} assigned flight {callsign} at {target_airport}",
                             message=(
-                                f"{reg}{notes} - now showing new callsign {callsign} "
+                                f"{reg}{notes} - now assigned {callsign} "
                                 f"(was {previous_callsign}) while parked at "
                                 f"{target_airport} - departure likely imminent{dest_text}"
                             ),
