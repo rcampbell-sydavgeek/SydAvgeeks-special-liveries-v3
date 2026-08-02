@@ -229,6 +229,40 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Initial great-circle bearing from point 1 to point 2, in degrees (0-360)."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def heading_is_plausible(lat, lon, true_track, target_lat, target_lon, max_deviation_deg=75):
+    """
+    Sanity check: does the aircraft's actual reported heading roughly agree
+    with the bearing it would need to fly to reach the target airport?
+
+    This guards against a stale/wrong destination lookup (which happens
+    more often for charter/cargo carriers that reuse callsigns across
+    different ad-hoc routes, unlike scheduled airlines) - if the plane's
+    real-world track points nowhere near the target, we don't trust the
+    destination match, regardless of what the route database says.
+
+    Returns True if we can't check (missing data) - i.e. fails open,
+    since this is a secondary safety net, not the primary matching logic.
+    """
+    if lat is None or lon is None or true_track is None:
+        return True
+
+    required_bearing = bearing_deg(lat, lon, target_lat, target_lon)
+    diff = abs(true_track - required_bearing) % 360
+    if diff > 180:
+        diff = 360 - diff
+
+    return diff <= max_deviation_deg
+
+
 def estimate_eta_text(lat, lon, ground_speed_ms):
     """
     Rough ETA estimate: straight-line distance to the target airport divided
@@ -335,18 +369,31 @@ def main():
         print(f"{reg} ({callsign}) -> destination {dest!r} (comparing to target {target_airport!r})")
 
         if dest == target_airport:
+            lon, lat, ground_speed = state[5], state[6], state[9]
+            true_track = state[10]
+
+            if not heading_is_plausible(lat, lon, true_track, target_lat=TARGET_AIRPORT_LAT, target_lon=TARGET_AIRPORT_LON):
+                required_bearing = bearing_deg(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
+                print(
+                    f"  -> SUPPRESSED: {reg} destination lookup says {target_airport}, "
+                    f"but actual track ({true_track}) doesn't point that way "
+                    f"(would need ~{required_bearing:.0f}). Likely a stale route "
+                    f"lookup (common for charter/cargo callsigns) - not alerting."
+                )
+                time.sleep(0.2)
+                continue
+
             origin = get_origin(callsign)
             origin_text = f"from {origin} " if origin else ""
             notes = f" ({entry['notes']})" if entry["notes"] else ""
 
-            lon, lat, ground_speed = state[5], state[6], state[9]
             eta_text = estimate_eta_text(lat, lon, ground_speed)
             eta_part = f" - ETA {eta_text}" if eta_text else ""
 
             send_ntfy(
                 title=f"{reg} inbound to {target_airport}",
                 message=(
-                    f"{reg}{notes} - {callsign} - {origin_text}"
+                    f"{reg}{notes} - callsign {callsign} - {origin_text}"
                     f"heading to {target_airport}{eta_part}"
                 ),
             )
