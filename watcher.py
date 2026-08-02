@@ -3,14 +3,15 @@
 YSSY Special Livery Watcher
 ---------------------------
 Reads a list of tracked aircraft registrations from a Google Sheet,
-checks their live positions via OpenSky, resolves each airborne
-aircraft's destination AND origin airport via hexdb.io/adsbdb.com,
-and sends a push notification (via ntfy.sh):
-  - the first time a tracked aircraft is found heading TO YSSY, and
-  - the first time a tracked aircraft is found to have just departed
-    FROM YSSY
-These are independent alerts - an aircraft can trigger both, on
-different runs, without one blocking the other.
+checks their live positions via OpenSky, and sends a push
+notification (via ntfy.sh) for two independent events:
+  - a tracked aircraft is found (while airborne) heading TO YSSY, or
+  - a tracked aircraft, while PARKED at YSSY, is seen with a newly
+    assigned callsign/flight number - a heads-up that it's likely
+    about to push back and depart, giving time to get to the airport
+    before it actually moves.
+These are independent alerts with separate state, so getting notified
+about one doesn't affect the other's timing.
 
 Designed to be run on a schedule (e.g. every 5 minutes via GitHub
 Actions cron). State is kept in small JSON files so repeat runs
@@ -52,6 +53,11 @@ TARGET_AIRPORT_LON = 151.1772
 
 # Timezone to display the estimated arrival time in
 DISPLAY_TZ = ZoneInfo("Australia/Sydney")
+
+# How close (in km) to the target airport a parked aircraft needs to be
+# for a newly-appeared callsign to count as "assigned a departure flight
+# number here" rather than some coincidence elsewhere.
+GROUND_PROXIMITY_KM = 5
 
 # How many hours before we're willing to re-notify about the same aircraft
 # heading to the same airport again (covers next day's flight, etc.)
@@ -385,7 +391,7 @@ def main():
 
         callsign = (state[1] or "").strip()
         on_ground = state[8]
-        if on_ground or not callsign:
+        if not callsign:
             continue
 
         entry = tracked[icao24]
@@ -396,7 +402,9 @@ def main():
         last_notified_arr = notified.get(icao24)
         skip_arrival = last_notified_arr and (now - last_notified_arr) < RENOTIFY_AFTER_HOURS * 3600
 
-        if not skip_arrival:
+        if on_ground:
+            print(f"{reg} ({callsign}) -> on ground, skipping arrival check")
+        elif not skip_arrival:
             dest = get_destination(callsign)
             print(f"{reg} ({callsign}) -> destination {dest!r} (comparing to target {target_airport!r})")
 
@@ -430,26 +438,32 @@ def main():
 
             time.sleep(0.2)  # be polite to hexdb.io
 
-        # --- Departure check: has this aircraft just left the target airport?
+        # --- Pre-departure check: this aircraft is parked at YSSY and now
+        # showing a callsign - meaning ops/ATC has just assigned it a
+        # flight number for its next departure. This typically happens
+        # some time before pushback/taxi, giving a head start to get to
+        # the airport before the aircraft actually moves.
         last_notified_dep = notified_departures.get(icao24)
         skip_departure = last_notified_dep and (now - last_notified_dep) < RENOTIFY_AFTER_HOURS * 3600
 
-        if not skip_departure:
-            origin = get_origin(callsign)
-            print(f"{reg} ({callsign}) -> origin {origin!r} (comparing to target {target_airport!r} for departure)")
+        if not skip_departure and on_ground:
+            lon, lat = state[5], state[6]
+            if lat is not None and lon is not None:
+                distance_km = haversine_km(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
+                print(f"{reg} ({callsign}) -> on ground, {distance_km:.1f}km from {target_airport}")
 
-            if origin == target_airport:
-                dest_after = get_destination(callsign)
-                dest_text = f" - heading to {dest_after}" if dest_after else ""
+                if distance_km <= GROUND_PROXIMITY_KM:
+                    dest_after = get_destination(callsign)
+                    dest_text = f" - heading to {dest_after}" if dest_after else ""
 
-                send_ntfy(
-                    title=f"{reg} has departed {target_airport}",
-                    message=(
-                        f"{reg}{notes} - callsign {callsign} - "
-                        f"has just departed {target_airport}{dest_text}"
-                    ),
-                )
-                notified_departures[icao24] = now
+                    send_ntfy(
+                        title=f"{reg} assigned flight {callsign} at {target_airport}",
+                        message=(
+                            f"{reg}{notes} - now showing callsign {callsign} while "
+                            f"parked at {target_airport} - departure likely imminent{dest_text}"
+                        ),
+                    )
+                    notified_departures[icao24] = now
 
             time.sleep(0.2)  # be polite to hexdb.io
 
