@@ -158,6 +158,8 @@ def get_destination(callsign):
     callsign = callsign.strip()
     if not callsign:
         return None
+
+    # Try hexdb.io first
     url = HEXDB_CALLSIGN_DEST.format(cs=callsign)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -167,6 +169,28 @@ def get_destination(callsign):
                 return dest
     except requests.RequestException:
         pass
+
+    # Fall back to adsbdb.com - a different route dataset that sometimes
+    # has charter/cargo routes hexdb.io lacks (though many ad-hoc charter
+    # routes genuinely aren't published anywhere free, so a None result
+    # here is often a real data gap, not a bug).
+    try:
+        resp = requests.get(
+            ADSBDB_CALLSIGN.format(cs=callsign), headers=HEADERS, timeout=15
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            dest = (
+                data.get("response", {})
+                .get("flightroute", {})
+                .get("destination", {})
+                .get("icao_code")
+            )
+            if dest:
+                return dest.strip().upper()
+    except (requests.RequestException, ValueError):
+        pass
+
     return None
 
 
