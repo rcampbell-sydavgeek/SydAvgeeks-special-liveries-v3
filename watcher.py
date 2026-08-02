@@ -66,6 +66,7 @@ RENOTIFY_AFTER_HOURS = 20
 CACHE_FILE = Path("icao24_cache.json")     # registration -> icao24 hex
 NOTIFIED_FILE = Path("notified.json")       # icao24 -> last notified timestamp (arrivals)
 NOTIFIED_DEPARTURES_FILE = Path("notified_departures.json")  # icao24 -> last notified timestamp (departures)
+LAST_GROUND_CALLSIGN_FILE = Path("last_ground_callsign.json")  # icao24 -> callsign last seen while parked at target
 
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 HEXDB_REG_TO_HEX = "https://hexdb.io/reg-hex?reg={reg}"
@@ -359,6 +360,7 @@ def main():
     icao24_cache = load_json(CACHE_FILE, {})
     notified = load_json(NOTIFIED_FILE, {})
     notified_departures = load_json(NOTIFIED_DEPARTURES_FILE, {})
+    last_ground_callsign = load_json(LAST_GROUND_CALLSIGN_FILE, {})
 
     registrations = fetch_registrations()
     print(f"Loaded {len(registrations)} tracked registrations.")
@@ -438,37 +440,55 @@ def main():
 
             time.sleep(0.2)  # be polite to hexdb.io
 
-        # --- Pre-departure check: this aircraft is parked at YSSY and now
-        # showing a callsign - meaning ops/ATC has just assigned it a
-        # flight number for its next departure. This typically happens
-        # some time before pushback/taxi, giving a head start to get to
-        # the airport before the aircraft actually moves.
-        last_notified_dep = notified_departures.get(icao24)
-        skip_departure = last_notified_dep and (now - last_notified_dep) < RENOTIFY_AFTER_HOURS * 3600
-
-        if not skip_departure and on_ground:
+        # --- Pre-departure check: this aircraft is parked at YSSY and its
+        # callsign has CHANGED from what it was showing before - meaning
+        # ops/ATC has assigned it a new flight number for its next
+        # departure. Just seeing *a* callsign isn't enough on its own,
+        # since a parked aircraft often keeps broadcasting its arrival
+        # callsign for a while - only a change is a genuinely new
+        # assignment worth a heads-up.
+        if on_ground:
             lon, lat = state[5], state[6]
             if lat is not None and lon is not None:
                 distance_km = haversine_km(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
-                print(f"{reg} ({callsign}) -> on ground, {distance_km:.1f}km from {target_airport}")
 
                 if distance_km <= GROUND_PROXIMITY_KM:
-                    dest_after = get_destination(callsign)
-                    dest_text = f" - heading to {dest_after}" if dest_after else ""
-
-                    send_ntfy(
-                        title=f"{reg} assigned flight {callsign} at {target_airport}",
-                        message=(
-                            f"{reg}{notes} - now showing callsign {callsign} while "
-                            f"parked at {target_airport} - departure likely imminent{dest_text}"
-                        ),
+                    previous_callsign = last_ground_callsign.get(icao24)
+                    print(
+                        f"{reg} ({callsign}) -> parked {distance_km:.1f}km from {target_airport}, "
+                        f"previous callsign seen here: {previous_callsign!r}"
                     )
-                    notified_departures[icao24] = now
+
+                    if previous_callsign is None:
+                        # First time we've seen it parked here - this is
+                        # just its arrival callsign, not a new assignment.
+                        # Record it as the baseline; don't alert yet.
+                        last_ground_callsign[icao24] = callsign
+                    elif callsign != previous_callsign:
+                        dest_after = get_destination(callsign)
+                        dest_text = f" - heading to {dest_after}" if dest_after else ""
+
+                        send_ntfy(
+                            title=f"{reg} assigned flight {callsign} at {target_airport}",
+                            message=(
+                                f"{reg}{notes} - now showing new callsign {callsign} "
+                                f"(was {previous_callsign}) while parked at "
+                                f"{target_airport} - departure likely imminent{dest_text}"
+                            ),
+                        )
+                        last_ground_callsign[icao24] = callsign
+                        notified_departures[icao24] = now
 
             time.sleep(0.2)  # be polite to hexdb.io
+        else:
+            # Airborne again - clear the ground baseline so next time it
+            # lands, its arrival callsign is treated as a fresh baseline
+            # rather than compared against a stale value from days ago.
+            last_ground_callsign.pop(icao24, None)
 
     save_json(NOTIFIED_FILE, notified)
     save_json(NOTIFIED_DEPARTURES_FILE, notified_departures)
+    save_json(LAST_GROUND_CALLSIGN_FILE, last_ground_callsign)
 
 
 if __name__ == "__main__":
