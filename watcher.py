@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-YSSY Special Livery Watcher
----------------------------
+YSSY Special Livery Arrival Watcher
+------------------------------------
 Reads a list of tracked aircraft registrations from a Google Sheet,
 checks their live positions via OpenSky, and sends a push
-notification (via ntfy.sh) for two independent events:
-  - a tracked aircraft is found (while airborne) heading TO YSSY, or
-  - a tracked aircraft, while PARKED at YSSY, is seen with a newly
-    assigned callsign/flight number - a heads-up that it's likely
-    about to push back and depart, giving time to get to the airport
-    before it actually moves.
-These are independent alerts with separate state, so getting notified
-about one doesn't affect the other's timing.
+notification (via ntfy.sh) the first time a tracked aircraft is
+found (while airborne) heading TO YSSY.
+
+This is the ARRIVALS-only half of the project - the pre-departure
+"assigned a new flight number while parked" detection lives in a
+separate repo/script now, to keep each run fast and simple rather
+than doing both jobs' worth of lookups every 5 minutes.
 
 Designed to be run on a schedule (e.g. every 5 minutes via GitHub
 Actions cron). State is kept in small JSON files so repeat runs
@@ -54,19 +53,12 @@ TARGET_AIRPORT_LON = 151.1772
 # Timezone to display the estimated arrival time in
 DISPLAY_TZ = ZoneInfo("Australia/Sydney")
 
-# How close (in km) to the target airport a parked aircraft needs to be
-# for a newly-appeared callsign to count as "assigned a departure flight
-# number here" rather than some coincidence elsewhere.
-GROUND_PROXIMITY_KM = 5
-
 # How many hours before we're willing to re-notify about the same aircraft
 # heading to the same airport again (covers next day's flight, etc.)
 RENOTIFY_AFTER_HOURS = 20
 
 CACHE_FILE = Path("icao24_cache.json")     # registration -> icao24 hex
-NOTIFIED_FILE = Path("notified.json")       # icao24 -> last notified timestamp (arrivals)
-NOTIFIED_DEPARTURES_FILE = Path("notified_departures.json")  # icao24 -> last notified timestamp (departures)
-LAST_GROUND_CALLSIGN_FILE = Path("last_ground_callsign.json")  # icao24 -> callsign last seen while parked at target
+NOTIFIED_FILE = Path("notified.json")       # icao24 -> last notified timestamp
 
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 HEXDB_REG_TO_HEX = "https://hexdb.io/reg-hex?reg={reg}"
@@ -171,7 +163,6 @@ def get_destination(callsign):
     if not callsign:
         return None
 
-    # Try hexdb.io first
     url = HEXDB_CALLSIGN_DEST.format(cs=callsign)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -182,10 +173,6 @@ def get_destination(callsign):
     except requests.RequestException:
         pass
 
-    # Fall back to adsbdb.com - a different route dataset that sometimes
-    # has charter/cargo routes hexdb.io lacks (though many ad-hoc charter
-    # routes genuinely aren't published anywhere free, so a None result
-    # here is often a real data gap, not a bug).
     try:
         resp = requests.get(
             ADSBDB_CALLSIGN.format(cs=callsign), headers=HEADERS, timeout=15
@@ -212,7 +199,6 @@ def get_origin(callsign):
     if not callsign:
         return None
 
-    # Try hexdb.io first
     url = HEXDB_CALLSIGN_ORIGIN.format(cs=callsign)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -223,8 +209,6 @@ def get_origin(callsign):
     except requests.RequestException:
         pass
 
-    # Fall back to adsbdb.com, which draws from a broader route dataset and
-    # sometimes has origin data hexdb.io is missing.
     try:
         resp = requests.get(
             ADSBDB_CALLSIGN.format(cs=callsign), headers=HEADERS, timeout=15
@@ -278,15 +262,9 @@ def heading_is_plausible(lat, lon, true_track, target_lat, target_lon, max_devia
     """
     Sanity check: does the aircraft's actual reported heading roughly agree
     with the bearing it would need to fly to reach the target airport?
-
-    This guards against a stale/wrong destination lookup (which happens
-    more often for charter/cargo carriers that reuse callsigns across
-    different ad-hoc routes, unlike scheduled airlines) - if the plane's
-    real-world track points nowhere near the target, we don't trust the
-    destination match, regardless of what the route database says.
-
-    Returns True if we can't check (missing data) - i.e. fails open,
-    since this is a secondary safety net, not the primary matching logic.
+    Guards against a stale/wrong destination lookup (more common for
+    charter/cargo carriers that reuse callsigns across different ad-hoc
+    routes). Fails open (returns True) if position/track data is missing.
     """
     if lat is None or lon is None or true_track is None:
         return True
@@ -302,11 +280,7 @@ def heading_is_plausible(lat, lon, true_track, target_lat, target_lon, max_devia
 def estimate_eta_text(lat, lon, ground_speed_ms):
     """
     Rough ETA estimate: straight-line distance to the target airport divided
-    by current ground speed. This is NOT a real flight-plan ETA - it ignores
-    the actual route, remaining descent/holding, and any speed changes - but
-    it's a reasonable ballpark for a notification.
-    Returns a string like "~1h 42m (approx 14:35 AEST)", or None if we don't
-    have enough data (e.g. ground speed is missing or near zero).
+    by current ground speed. NOT a real flight-plan ETA.
     """
     if lat is None or lon is None or not ground_speed_ms or ground_speed_ms < 20:
         return None
@@ -316,8 +290,6 @@ def estimate_eta_text(lat, lon, ground_speed_ms):
     eta_hours = distance_km / speed_kmh
 
     if eta_hours > 20:
-        # Sanity cap - at this range the straight-line estimate is too rough
-        # to be worth showing (e.g. still near the departure airport).
         return None
 
     hours = int(eta_hours)
@@ -359,13 +331,10 @@ def main():
 
     icao24_cache = load_json(CACHE_FILE, {})
     notified = load_json(NOTIFIED_FILE, {})
-    notified_departures = load_json(NOTIFIED_DEPARTURES_FILE, {})
-    last_ground_callsign = load_json(LAST_GROUND_CALLSIGN_FILE, {})
 
     registrations = fetch_registrations()
     print(f"Loaded {len(registrations)} tracked registrations.")
 
-    # Build reg -> icao24 map, looking up any we don't have cached yet
     tracked = {}
     for entry in registrations:
         reg = entry["registration"]
@@ -374,7 +343,7 @@ def main():
             tracked[hexcode] = entry
         else:
             print(f"Could not resolve ICAO24 for registration {reg}")
-        time.sleep(0.2)  # be polite to hexdb.io
+        time.sleep(0.2)
 
     save_json(CACHE_FILE, icao24_cache)
 
@@ -393,102 +362,51 @@ def main():
 
         callsign = (state[1] or "").strip()
         on_ground = state[8]
-        if not callsign:
-            continue
+        if on_ground or not callsign:
+            continue  # arrivals-only: skip parked aircraft entirely
 
         entry = tracked[icao24]
         reg = entry["registration"]
         notes = f" ({entry['notes']})" if entry["notes"] else ""
 
-        # --- Arrival check: is this aircraft heading TO the target airport?
-        last_notified_arr = notified.get(icao24)
-        skip_arrival = last_notified_arr and (now - last_notified_arr) < RENOTIFY_AFTER_HOURS * 3600
+        last_notified = notified.get(icao24)
+        if last_notified and (now - last_notified) < RENOTIFY_AFTER_HOURS * 3600:
+            continue
 
-        if on_ground:
-            print(f"{reg} ({callsign}) -> on ground, skipping arrival check")
-        elif not skip_arrival:
-            dest = get_destination(callsign)
-            print(f"{reg} ({callsign}) -> destination {dest!r} (comparing to target {target_airport!r})")
+        dest = get_destination(callsign)
+        print(f"{reg} ({callsign}) -> destination {dest!r} (comparing to target {target_airport!r})")
 
-            if dest == target_airport:
-                lon, lat, ground_speed = state[5], state[6], state[9]
-                true_track = state[10]
+        if dest == target_airport:
+            lon, lat, ground_speed = state[5], state[6], state[9]
+            true_track = state[10]
 
-                if not heading_is_plausible(lat, lon, true_track, target_lat=TARGET_AIRPORT_LAT, target_lon=TARGET_AIRPORT_LON):
-                    required_bearing = bearing_deg(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
-                    print(
-                        f"  -> SUPPRESSED: {reg} destination lookup says {target_airport}, "
-                        f"but actual track ({true_track}) doesn't point that way "
-                        f"(would need ~{required_bearing:.0f}). Likely a stale route "
-                        f"lookup (common for charter/cargo callsigns) - not alerting."
-                    )
-                else:
-                    origin = get_origin(callsign)
-                    origin_text = f"from {origin} " if origin else ""
+            if not heading_is_plausible(lat, lon, true_track, target_lat=TARGET_AIRPORT_LAT, target_lon=TARGET_AIRPORT_LON):
+                required_bearing = bearing_deg(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
+                print(
+                    f"  -> SUPPRESSED: {reg} destination lookup says {target_airport}, "
+                    f"but actual track ({true_track}) doesn't point that way "
+                    f"(would need ~{required_bearing:.0f}). Likely a stale route "
+                    f"lookup (common for charter/cargo callsigns) - not alerting."
+                )
+            else:
+                origin = get_origin(callsign)
+                origin_text = f"from {origin} " if origin else ""
 
-                    eta_text = estimate_eta_text(lat, lon, ground_speed)
-                    eta_part = f" - ETA {eta_text}" if eta_text else ""
+                eta_text = estimate_eta_text(lat, lon, ground_speed)
+                eta_part = f" - ETA {eta_text}" if eta_text else ""
 
-                    send_ntfy(
-                        title=f"{reg} inbound to {target_airport}",
-                        message=(
-                            f"{reg}{notes} - {callsign} - {origin_text}"
-                            f"heading to {target_airport}{eta_part}"
-                        ),
-                    )
-                    notified[icao24] = now
+                send_ntfy(
+                    title=f"{reg} inbound to {target_airport}",
+                    message=(
+                        f"{reg}{notes} - callsign {callsign} - {origin_text}"
+                        f"heading to {target_airport}{eta_part}"
+                    ),
+                )
+                notified[icao24] = now
 
-            time.sleep(0.2)  # be polite to hexdb.io
-
-        # --- Pre-departure check: this aircraft is parked at YSSY and its
-        # callsign has CHANGED from what it was showing before - meaning
-        # ops/ATC has assigned it a new flight number for its next
-        # departure. Just seeing *a* callsign isn't enough on its own,
-        # since a parked aircraft often keeps broadcasting its arrival
-        # callsign for a while - only a change is a genuinely new
-        # assignment worth a heads-up.
-        if on_ground:
-            lon, lat = state[5], state[6]
-            if lat is not None and lon is not None:
-                distance_km = haversine_km(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
-
-                if distance_km <= GROUND_PROXIMITY_KM:
-                    previous_callsign = last_ground_callsign.get(icao24)
-                    print(
-                        f"{reg} ({callsign}) -> parked {distance_km:.1f}km from {target_airport}, "
-                        f"previous callsign seen here: {previous_callsign!r}"
-                    )
-
-                    if previous_callsign is None:
-                        # First time we've seen it parked here - this is
-                        # just its arrival callsign, not a new assignment.
-                        # Record it as the baseline; don't alert yet.
-                        last_ground_callsign[icao24] = callsign
-                    elif callsign != previous_callsign:
-                        dest_after = get_destination(callsign)
-                        dest_text = f" - heading to {dest_after}" if dest_after else ""
-
-                        send_ntfy(
-                            title=f"{reg} assigned flight {callsign} at {target_airport}",
-                            message=(
-                                f"{reg}{notes} - now assigned {callsign} "
-                                f"(was {previous_callsign}) while parked at "
-                                f"{target_airport} - departure likely imminent{dest_text}"
-                            ),
-                        )
-                        last_ground_callsign[icao24] = callsign
-                        notified_departures[icao24] = now
-
-            time.sleep(0.2)  # be polite to hexdb.io
-        else:
-            # Airborne again - clear the ground baseline so next time it
-            # lands, its arrival callsign is treated as a fresh baseline
-            # rather than compared against a stale value from days ago.
-            last_ground_callsign.pop(icao24, None)
+        time.sleep(0.2)
 
     save_json(NOTIFIED_FILE, notified)
-    save_json(NOTIFIED_DEPARTURES_FILE, notified_departures)
-    save_json(LAST_GROUND_CALLSIGN_FILE, last_ground_callsign)
 
 
 if __name__ == "__main__":
