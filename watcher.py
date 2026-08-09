@@ -42,6 +42,11 @@ GOOGLE_SHEET_CSV_URL = os.environ.get("GOOGLE_SHEET_CSV_URL", "")
 # Install the ntfy app on Android and subscribe to this same topic name.
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
+# Optional - if set, real (live-tracked) ETAs from AeroDataBox are used
+# instead of the physics-based estimate whenever available. Get a free key
+# at rapidapi.com/aedbx-aedbx/api/aerodatabox (Basic/free tier).
+AERODATABOX_API_KEY = os.environ.get("AERODATABOX_API_KEY", "")
+
 TARGET_AIRPORT_ICAO = "YSSY"
 
 # Coordinates of the target airport, used only for the rough ETA estimate
@@ -277,16 +282,39 @@ def heading_is_plausible(lat, lon, true_track, target_lat, target_lon, max_devia
     return diff <= max_deviation_deg
 
 
+# If the aircraft's current ground speed is below this, it's likely still
+# climbing out rather than at cruise - using that slow instantaneous speed
+# to project the ENTIRE remaining distance badly overestimates flight time
+# (this is what caused ETAs to come out hours too late for aircraft caught
+# shortly after takeoff on a long route).
+CRUISE_SPEED_FLOOR_MS = 180  # ~350 kt
+
+# Reasonable average ground speed to assume instead, once we've decided the
+# current reading isn't representative of the rest of the flight.
+ASSUMED_CRUISE_SPEED_MS = 230  # ~447 kt / ~828 km/h
+
+
 def estimate_eta_text(lat, lon, ground_speed_ms):
     """
     Rough ETA estimate: straight-line distance to the target airport divided
-    by current ground speed. NOT a real flight-plan ETA.
+    by a representative ground speed. NOT a real flight-plan ETA - ignores
+    actual routing, altitude changes, wind, and holding.
     """
     if lat is None or lon is None or not ground_speed_ms or ground_speed_ms < 20:
         return None
 
     distance_km = haversine_km(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
-    speed_kmh = ground_speed_ms * 3.6
+
+    speed_for_eta_ms = ground_speed_ms
+    still_climbing_note = ""
+    if ground_speed_ms < CRUISE_SPEED_FLOOR_MS and distance_km > 300:
+        # Current speed looks like climb-out, not cruise, and there's a lot
+        # of distance left - substitute an assumed cruise speed rather than
+        # projecting the slow current speed across the whole remaining trip.
+        speed_for_eta_ms = ASSUMED_CRUISE_SPEED_MS
+        still_climbing_note = ", still climbing - rough estimate"
+
+    speed_kmh = speed_for_eta_ms * 3.6
     eta_hours = distance_km / speed_kmh
 
     if eta_hours > 20:
@@ -303,7 +331,70 @@ def estimate_eta_text(lat, lon, ground_speed_ms):
     tz_label = arrival_local.tzname() or "local"
 
     duration_text = f"{hours}h {minutes}m" if hours else f"{minutes}m"
-    return f"~{duration_text} (approx {arrival_local.strftime('%H:%M')} {tz_label})"
+    return f"~{duration_text} (approx {arrival_local.strftime('%H:%M')} {tz_label}{still_climbing_note})"
+
+
+def get_real_eta(registration, target_airport):
+    """
+    Look up the REAL, live-tracked arrival time from AeroDataBox, rather
+    than estimating from current speed/distance. Only called for an
+    aircraft that's already been matched via live OpenSky data as heading
+    to the target airport - this is a refinement of an existing match,
+    not a replacement for the detection itself.
+
+    Returns a formatted string like "09:06 local (live-tracked, flight
+    QF 589)", or None if AeroDataBox isn't configured, has no data for
+    this flight, or the request fails for any reason (fails silently so
+    the caller can fall back to the physics-based estimate).
+    """
+    if not AERODATABOX_API_KEY:
+        return None
+
+    url = f"https://aerodatabox.p.rapidapi.com/flights/reg/{registration}"
+    params = {"withAircraftImage": "false", "withLocation": "false", "withFlightPlan": "false"}
+    headers = {
+        "x-rapidapi-host": "aerodatabox.p.rapidapi.com",
+        "x-rapidapi-key": AERODATABOX_API_KEY,
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None
+        flights = resp.json()
+        if not isinstance(flights, list) or not flights:
+            return None
+    except (requests.RequestException, ValueError):
+        return None
+
+    candidates = [
+        f for f in flights
+        if f.get("arrival", {}).get("airport", {}).get("icao") == target_airport
+    ]
+    if not candidates:
+        return None
+
+    # Prefer the actual operating flight (not a codeshare number) that's
+    # currently en route over one that's merely "Expected" later today.
+    candidates.sort(key=lambda f: (
+        f.get("codeshareStatus") != "IsOperator",
+        f.get("status") != "EnRoute",
+    ))
+    flight = candidates[0]
+    arrival = flight.get("arrival", {})
+
+    predicted = arrival.get("predictedTime", {}).get("local")
+    revised = arrival.get("revisedTime", {}).get("local")
+    scheduled = arrival.get("scheduledTime", {}).get("local")
+    best_time = predicted or revised or scheduled
+    if not best_time:
+        return None
+
+    source = "live-tracked" if predicted else ("revised" if revised else "scheduled")
+    time_part = best_time.split(" ")[1][:5] if " " in best_time else best_time
+    flight_number = flight.get("number", "")
+
+    return f"{time_part} local ({source}, flight {flight_number})"
 
 
 def send_ntfy(title, message):
@@ -392,13 +483,17 @@ def main():
                 origin = get_origin(callsign)
                 origin_text = f"from {origin} " if origin else ""
 
-                eta_text = estimate_eta_text(lat, lon, ground_speed)
-                eta_part = f" - ETA {eta_text}" if eta_text else ""
+                real_eta = get_real_eta(reg, target_airport)
+                if real_eta:
+                    eta_part = f" - ETA {real_eta}"
+                else:
+                    eta_text = estimate_eta_text(lat, lon, ground_speed)
+                    eta_part = f" - ETA {eta_text} (estimated)" if eta_text else ""
 
                 send_ntfy(
                     title=f"{reg} inbound to {target_airport}",
                     message=(
-                        f"{reg}{notes} - callsign {callsign} - {origin_text}"
+                        f"{reg}{notes} - {callsign} - {origin_text}"
                         f"heading to {target_airport}{eta_part}"
                     ),
                 )
