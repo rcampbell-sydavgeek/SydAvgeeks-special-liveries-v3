@@ -43,8 +43,10 @@ GOOGLE_SHEET_CSV_URL = os.environ.get("GOOGLE_SHEET_CSV_URL", "")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
 # Optional - if set, real (live-tracked) ETAs from AeroDataBox are used
-# instead of the physics-based estimate whenever available. Get a free key
-# at rapidapi.com/aedbx-aedbx/api/aerodatabox (Basic/free tier).
+# instead of the physics-based estimate whenever available, AND used as a
+# second-layer cross-check against the bearing sanity check (see
+# check_aerodatabox below). Get a free key at
+# rapidapi.com/aedbx-aedbx/api/aerodatabox (Basic/free tier).
 AERODATABOX_API_KEY = os.environ.get("AERODATABOX_API_KEY", "")
 
 TARGET_AIRPORT_ICAO = "YSSY"
@@ -64,6 +66,15 @@ RENOTIFY_AFTER_HOURS = 20
 
 CACHE_FILE = Path("icao24_cache.json")     # registration -> icao24 hex
 NOTIFIED_FILE = Path("notified.json")       # icao24 -> last notified timestamp
+PENDING_CONFIRMATION_FILE = Path("pending_confirmation.json")  # icao24 -> first-seen timestamp, awaiting a second poll
+
+# For aircraft AeroDataBox has no data on (common for ad-hoc cargo/charter
+# carriers), a single bearing-check pass isn't trusted alone anymore - the
+# match must repeat on a LATER poll before alerting, since a genuinely
+# YSSY-bound aircraft will still match next time, while a coincidental
+# bearing alignment from a stale/reused callsign usually won't.
+MIN_CONFIRMATION_GAP_SECONDS = 180   # ~3 min - ensures it's a genuinely separate poll
+PENDING_EXPIRY_SECONDS = 40 * 60     # drop a pending match that never confirms within 40 min
 
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 HEXDB_REG_TO_HEX = "https://hexdb.io/reg-hex?reg={reg}"
@@ -121,8 +132,6 @@ def get_icao24(registration, cache):
     if registration in cache:
         return cache[registration]
 
-    # US "N-number" registrations map to their ICAO24 hex via a fixed,
-    # publicly documented formula - no lookup needed, and it can't go stale.
     if registration.startswith("N"):
         try:
             hexcode = n_to_icao(registration).strip().lower()
@@ -130,9 +139,8 @@ def get_icao24(registration, cache):
                 cache[registration] = hexcode
                 return hexcode
         except (ValueError, KeyError):
-            pass  # not a valid N-number format - fall through to lookups
+            pass
 
-    # Try hexdb.io next
     url = HEXDB_REG_TO_HEX.format(reg=registration)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -143,8 +151,6 @@ def get_icao24(registration, cache):
     except requests.RequestException:
         pass
 
-    # Fall back to adsbdb.com, which draws from a different registry dataset
-    # and often has aircraft (especially non-US/UK registries) hexdb.io lacks.
     try:
         resp = requests.get(
             ADSBDB_AIRCRAFT.format(reg=registration), headers=HEADERS, timeout=15
@@ -263,13 +269,18 @@ def bearing_deg(lat1, lon1, lat2, lon2):
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
 
-def heading_is_plausible(lat, lon, true_track, target_lat, target_lon, max_deviation_deg=75):
+def heading_is_plausible(lat, lon, true_track, target_lat, target_lon, max_deviation_deg=45):
     """
     Sanity check: does the aircraft's actual reported heading roughly agree
     with the bearing it would need to fly to reach the target airport?
-    Guards against a stale/wrong destination lookup (more common for
-    charter/cargo carriers that reuse callsigns across different ad-hoc
-    routes). Fails open (returns True) if position/track data is missing.
+    Guards against a stale/wrong destination lookup. Fails open (returns
+    True) if position/track data is missing.
+
+    NOTE: this checks bearing from the CURRENT position, not the origin -
+    on a long-haul route with a curving great-circle path, this can
+    occasionally line up coincidentally even when the true destination is
+    completely different. See check_aerodatabox() for a stronger,
+    schedule-data-based cross-check that doesn't have this blind spot.
     """
     if lat is None or lon is None or true_track is None:
         return True
@@ -282,23 +293,14 @@ def heading_is_plausible(lat, lon, true_track, target_lat, target_lon, max_devia
     return diff <= max_deviation_deg
 
 
-# If the aircraft's current ground speed is below this, it's likely still
-# climbing out rather than at cruise - using that slow instantaneous speed
-# to project the ENTIRE remaining distance badly overestimates flight time
-# (this is what caused ETAs to come out hours too late for aircraft caught
-# shortly after takeoff on a long route).
 CRUISE_SPEED_FLOOR_MS = 180  # ~350 kt
-
-# Reasonable average ground speed to assume instead, once we've decided the
-# current reading isn't representative of the rest of the flight.
 ASSUMED_CRUISE_SPEED_MS = 230  # ~447 kt / ~828 km/h
 
 
 def estimate_eta_text(lat, lon, ground_speed_ms):
     """
     Rough ETA estimate: straight-line distance to the target airport divided
-    by a representative ground speed. NOT a real flight-plan ETA - ignores
-    actual routing, altitude changes, wind, and holding.
+    by a representative ground speed. NOT a real flight-plan ETA.
     """
     if lat is None or lon is None or not ground_speed_ms or ground_speed_ms < 20:
         return None
@@ -308,9 +310,6 @@ def estimate_eta_text(lat, lon, ground_speed_ms):
     speed_for_eta_ms = ground_speed_ms
     still_climbing_note = ""
     if ground_speed_ms < CRUISE_SPEED_FLOOR_MS and distance_km > 300:
-        # Current speed looks like climb-out, not cruise, and there's a lot
-        # of distance left - substitute an assumed cruise speed rather than
-        # projecting the slow current speed across the whole remaining trip.
         speed_for_eta_ms = ASSUMED_CRUISE_SPEED_MS
         still_climbing_note = ", still climbing - rough estimate"
 
@@ -334,21 +333,33 @@ def estimate_eta_text(lat, lon, ground_speed_ms):
     return f"~{duration_text} (approx {arrival_local.strftime('%H:%M')} {tz_label}{still_climbing_note})"
 
 
-def get_real_eta(registration, target_airport):
+def check_aerodatabox(registration, target_airport):
     """
-    Look up the REAL, live-tracked arrival time from AeroDataBox, rather
-    than estimating from current speed/distance. Only called for an
-    aircraft that's already been matched via live OpenSky data as heading
-    to the target airport - this is a refinement of an existing match,
-    not a replacement for the detection itself.
+    Cross-checks a suspected arrival against AeroDataBox's real schedule/
+    live-tracking data. Returns (verdict, eta_text):
 
-    Returns a formatted string like "09:06 local (live-tracked, flight
-    QF 589)", or None if AeroDataBox isn't configured, has no data for
-    this flight, or the request fails for any reason (fails silently so
-    the caller can fall back to the physics-based estimate).
+      'confirmed'    - AeroDataBox shows a flight for this registration
+                        genuinely arriving at target_airport. eta_text has
+                        the real (live-tracked where possible) time.
+      'contradicted' - AeroDataBox has flight data for this registration
+                        today, but NONE of it goes to target_airport - a
+                        strong signal the destination lookup used for the
+                        initial match was wrong (e.g. a stale/reused
+                        charter callsign). Caller should NOT alert.
+      'unknown'      - AeroDataBox isn't configured, has no data at all
+                        for this registration (common for ad-hoc cargo/
+                        charter operators), or the request failed. Can't
+                        confirm or contradict - caller should fall back to
+                        trusting the bearing check alone.
+
+    This exists because the bearing sanity check alone has a blind spot on
+    long-haul curving routes: the required bearing from the aircraft's
+    CURRENT position to the target can occasionally coincide with its
+    actual heading even when the true destination is completely different.
+    Real schedule data doesn't have that geometric blind spot.
     """
     if not AERODATABOX_API_KEY:
-        return None
+        return "unknown", None
 
     url = f"https://aerodatabox.p.rapidapi.com/flights/reg/{registration}"
     params = {"withAircraftImage": "false", "withLocation": "false", "withFlightPlan": "false"}
@@ -360,22 +371,23 @@ def get_real_eta(registration, target_airport):
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         if resp.status_code != 200:
-            return None
+            return "unknown", None
         flights = resp.json()
         if not isinstance(flights, list) or not flights:
-            return None
+            return "unknown", None
     except (requests.RequestException, ValueError):
-        return None
+        return "unknown", None
 
     candidates = [
         f for f in flights
         if f.get("arrival", {}).get("airport", {}).get("icao") == target_airport
     ]
-    if not candidates:
-        return None
 
-    # Prefer the actual operating flight (not a codeshare number) that's
-    # currently en route over one that's merely "Expected" later today.
+    if not candidates:
+        # AeroDataBox has real flight data for this aircraft today, but
+        # none of it lands at our target - this contradicts the match.
+        return "contradicted", None
+
     candidates.sort(key=lambda f: (
         f.get("codeshareStatus") != "IsOperator",
         f.get("status") != "EnRoute",
@@ -388,13 +400,13 @@ def get_real_eta(registration, target_airport):
     scheduled = arrival.get("scheduledTime", {}).get("local")
     best_time = predicted or revised or scheduled
     if not best_time:
-        return None
+        return "confirmed", None
 
     source = "live-tracked" if predicted else ("revised" if revised else "scheduled")
     time_part = best_time.split(" ")[1][:5] if " " in best_time else best_time
     flight_number = flight.get("number", "")
 
-    return f"{time_part} local ({source}, flight {flight_number})"
+    return "confirmed", f"{time_part} local ({source}, flight {flight_number})"
 
 
 def send_ntfy(title, message):
@@ -422,6 +434,7 @@ def main():
 
     icao24_cache = load_json(CACHE_FILE, {})
     notified = load_json(NOTIFIED_FILE, {})
+    pending_confirmation = load_json(PENDING_CONFIRMATION_FILE, {})
 
     registrations = fetch_registrations()
     print(f"Loaded {len(registrations)} tracked registrations.")
@@ -454,7 +467,7 @@ def main():
         callsign = (state[1] or "").strip()
         on_ground = state[8]
         if on_ground or not callsign:
-            continue  # arrivals-only: skip parked aircraft entirely
+            continue
 
         entry = tracked[icao24]
         reg = entry["registration"]
@@ -474,34 +487,89 @@ def main():
             if not heading_is_plausible(lat, lon, true_track, target_lat=TARGET_AIRPORT_LAT, target_lon=TARGET_AIRPORT_LON):
                 required_bearing = bearing_deg(lat, lon, TARGET_AIRPORT_LAT, TARGET_AIRPORT_LON)
                 print(
-                    f"  -> SUPPRESSED: {reg} destination lookup says {target_airport}, "
+                    f"  -> SUPPRESSED (bearing check): {reg} destination lookup says {target_airport}, "
                     f"but actual track ({true_track}) doesn't point that way "
                     f"(would need ~{required_bearing:.0f}). Likely a stale route "
                     f"lookup (common for charter/cargo callsigns) - not alerting."
                 )
             else:
-                origin = get_origin(callsign)
-                origin_text = f"from {origin} " if origin else ""
+                verdict, real_eta = check_aerodatabox(reg, target_airport)
+                print(f"  -> AeroDataBox cross-check: {verdict}")
 
-                real_eta = get_real_eta(reg, target_airport)
-                if real_eta:
-                    eta_part = f" - ETA {real_eta}"
-                else:
-                    eta_text = estimate_eta_text(lat, lon, ground_speed)
-                    eta_part = f" - ETA {eta_text} (estimated)" if eta_text else ""
+                if verdict == "contradicted":
+                    print(
+                        f"  -> SUPPRESSED (AeroDataBox): {reg} has real flight data today, "
+                        f"but none of it arrives at {target_airport}. The destination "
+                        f"lookup ({dest}) appears to be wrong - not alerting."
+                    )
+                    pending_confirmation.pop(icao24, None)
 
-                send_ntfy(
-                    title=f"{reg} inbound to {target_airport}",
-                    message=(
-                        f"{reg}{notes} - {callsign} - {origin_text}"
-                        f"heading to {target_airport}{eta_part}"
-                    ),
-                )
-                notified[icao24] = now
+                elif verdict == "unknown":
+                    # No AeroDataBox data to confirm or deny (common for
+                    # ad-hoc cargo/charter carriers) - the bearing check is
+                    # our only signal here, so require it to hold on a
+                    # LATER poll before trusting it, rather than alerting
+                    # off one snapshot.
+                    pending = pending_confirmation.get(icao24)
+
+                    if pending is None:
+                        pending_confirmation[icao24] = {"first_seen": now, "dest": dest}
+                        print(
+                            f"  -> WAITING for second confirmation poll: {reg} passed the "
+                            f"bearing check but AeroDataBox has no data to confirm it - "
+                            f"will alert only if this still matches on a later run."
+                        )
+                    else:
+                        elapsed = now - pending["first_seen"]
+                        if elapsed >= MIN_CONFIRMATION_GAP_SECONDS:
+                            origin = get_origin(callsign)
+                            origin_text = f"from {origin} " if origin else ""
+                            eta_text = estimate_eta_text(lat, lon, ground_speed)
+                            eta_part = f" - ETA {eta_text} (estimated)" if eta_text else ""
+
+                            send_ntfy(
+                                title=f"{reg} inbound to {target_airport}",
+                                message=(
+                                    f"{reg}{notes} - {callsign} - {origin_text}"
+                                    f"heading to {target_airport}{eta_part} "
+                                    f"(confirmed on second poll)"
+                                ),
+                            )
+                            notified[icao24] = now
+                            pending_confirmation.pop(icao24, None)
+                        else:
+                            print(f"  -> still waiting on second poll ({elapsed:.0f}s since first seen)")
+
+                else:  # verdict == "confirmed" - trust immediately, no need to wait
+                    pending_confirmation.pop(icao24, None)
+                    origin = get_origin(callsign)
+                    origin_text = f"from {origin} " if origin else ""
+                    eta_part = f" - ETA {real_eta}" if real_eta else ""
+
+                    send_ntfy(
+                        title=f"{reg} inbound to {target_airport}",
+                        message=(
+                            f"{reg}{notes} - {callsign} - {origin_text}"
+                            f"heading to {target_airport}{eta_part}"
+                        ),
+                    )
+                    notified[icao24] = now
 
         time.sleep(0.2)
 
+    # Drop any pending confirmations that never got a second matching poll -
+    # the aircraft likely changed course, landed elsewhere, or the initial
+    # bearing match was a one-off coincidence.
+    expired = [
+        k for k, v in pending_confirmation.items()
+        if now - v.get("first_seen", now) > PENDING_EXPIRY_SECONDS
+    ]
+    for k in expired:
+        print(f"  -> Pending confirmation for {k} expired without a second match - dropping.")
+        del pending_confirmation[k]
+
     save_json(NOTIFIED_FILE, notified)
+    save_json(PENDING_CONFIRMATION_FILE, pending_confirmation)
 
 
 if __name__ == "__main__":
